@@ -13,6 +13,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -38,16 +39,20 @@ func getUpgradeRequest(req *http.Request) string {
 	return ""
 }
 
-// UpgradeProxy stores everything needed to make the connection upgrade.
+// upgradeProxy stores everything needed to make the connection upgrade.
 type upgradeProxy struct {
 	backendAddr     *url.URL
 	reverseProxy    *httputil.ReverseProxy
 	tlsClientConfig *tls.Config
 	insecure        bool
-	useAuditLog     bool
-	auditLogOut     io.Writer
-	auditLogErr     io.Writer
-	auditLogHook    chan struct{}
+	// dialTimeout bounds the TCP+TLS connect phase for backend upgrade
+	// connections. When zero the dialer relies solely on any deadline
+	// already carried by the client request context.
+	dialTimeout  time.Duration
+	useAuditLog  bool
+	auditLogOut  io.Writer
+	auditLogErr  io.Writer
+	auditLogHook chan struct{}
 }
 
 // TODO: add user here
@@ -185,31 +190,52 @@ func (p *upgradeProxy) serveHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+// dialBackend opens a TCP (or TLS) connection to the backend, propagating
+// the client request context so that cancellation — client disconnect,
+// per-request deadline, or proxy shutdown — aborts the dial immediately.
+// This eliminates the goroutine-accumulation hazard that occurred when
+// bare net.Dial / tls.Dial blocked indefinitely against stalled backends:
+// each blocked goroutine held an OS thread and a file descriptor until the
+// OS TCP-connect timeout fired (typically 2+ minutes), causing process-wide
+// resource starvation under sustained load.
+//
+// Two independent back-stop mechanisms now bound every dial:
+//  1. p.dialTimeout — a hard wall-clock ceiling for the TCP+TLS handshake,
+//     sourced from Params.Timeout (the same value used by the regular HTTP
+//     transport). When zero, no additional deadline is imposed beyond the
+//     context.
+//  2. req.Context() — propagates client cancellation and any upstream
+//     deadline set by filters (e.g. BackendTimeout) directly into the
+//     syscall, so aborted requests release resources without waiting for
+//     the OS timeout.
 func (p *upgradeProxy) dialBackend(req *http.Request) (net.Conn, error) {
 	dialAddr := canonicalAddr(req.URL)
+	nd := &net.Dialer{Timeout: p.dialTimeout}
 
 	switch p.backendAddr.Scheme {
 	case "http":
-		return net.Dial("tcp", dialAddr)
+		return nd.DialContext(req.Context(), "tcp", dialAddr)
 	case "https":
-		tlsConn, err := tls.Dial("tcp", dialAddr, p.tlsClientConfig)
+		tlsDialer := &tls.Dialer{
+			NetDialer: nd,
+			Config:    p.tlsClientConfig,
+		}
+		conn, err := tlsDialer.DialContext(req.Context(), "tcp", dialAddr)
 		if err != nil {
 			return nil, err
 		}
-
 		if !p.insecure {
 			hostToVerify, _, err := net.SplitHostPort(dialAddr)
 			if err != nil {
+				conn.Close()
 				return nil, err
 			}
-			err = tlsConn.VerifyHostname(hostToVerify)
-			if err != nil {
-				tlsConn.Close()
+			if err = conn.(*tls.Conn).VerifyHostname(hostToVerify); err != nil {
+				conn.Close()
 				return nil, err
 			}
 		}
-
-		return tlsConn, nil
+		return conn, nil
 	default:
 		return nil, fmt.Errorf("unknown scheme: %s", p.backendAddr.Scheme)
 	}
